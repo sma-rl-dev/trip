@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="${PORT:-18185}"
+RUN_ID="${RUN_ID:-}"
+
+while (($#)); do
+  case "$1" in
+    --port) PORT="$2"; shift 2 ;;
+    --run-id) RUN_ID="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+COMMAND="${1:-help}"
+SUFFIX="${RUN_ID:+-${RUN_ID}}"
+PROJECT_NAME="tester-env-trip${SUFFIX}"
+IMAGE_NAME="${IMAGE_TAG:-tester-env-trip:dev}"
+COMPOSE=(docker compose -p "$PROJECT_NAME" -f "$SCRIPT_DIR/docker-compose.tester-env.yml")
+URL="http://localhost:${PORT}"
+USERNAME="tester"
+PASSWORD="tester-env-trip-123"
+if [[ -z "${NETWORK_SUBNET:-}" ]]; then
+  read -r checksum _ < <(printf '%s' "${RUN_ID:-trip}" | cksum)
+  NETWORK_SUBNET="10.181.$((100 + checksum % 100)).0/24"
+fi
+export NETWORK_SUBNET
+
+api_token() {
+  local response
+  response="$(curl -fsS -X POST "$URL/api/auth/login" -H 'content-type: application/json' \
+    -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")"
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])' <<<"$response"
+}
+
+cmd_deploy() {
+  echo "==> Building $IMAGE_NAME from source"
+  PORT="$PORT" IMAGE_TAG="$IMAGE_NAME" "${COMPOSE[@]}" up --build -d
+  echo "==> Waiting for $URL/api/info"
+  for _ in {1..30}; do curl -fsS "$URL/api/info" >/dev/null && { echo "==> Running at $URL"; return; }; sleep 1; done
+  "${COMPOSE[@]}" logs --tail=100
+  return 1
+}
+
+cmd_seed() {
+  echo "==> Creating deterministic user and itinerary"
+  local registration token trips trip_id day day_id
+  registration="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL/api/auth/register" -H 'content-type: application/json' \
+    -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")"
+  [[ "$registration" == 200 || "$registration" == 409 ]] || { echo "registration failed: HTTP $registration" >&2; return 1; }
+  token="$(api_token)"
+  trips="$(curl -fsS "$URL/api/trips" -H "Authorization: Bearer $token")"
+  trip_id="$(python3 -c 'import json,sys; print(next((x["id"] for x in json.load(sys.stdin) if x["name"]=="Alpine Research Weekend"), ""))' <<<"$trips")"
+  if [[ -z "$trip_id" ]]; then
+    trip_id="$(curl -fsS -X POST "$URL/api/trips" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"name":"Alpine Research Weekend"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+    day="$(curl -fsS -X POST "$URL/api/trips/$trip_id/days" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"label":"Arrival","dt":"2026-10-12","notes":"Check in before dinner."}')"
+    day_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$day")"
+    curl -fsS -X POST "$URL/api/trips/$trip_id/days/$day_id/items" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"time":"18:30","text":"Lodge check-in","comment":"Reservation confirmed.","status":"booked"}' >/dev/null
+  fi
+  echo "==> Seeded user $USERNAME and trip Alpine Research Weekend"
+}
+
+cmd_verify() {
+  echo "==> Verifying deterministic seed"
+  local token trips trip_id detail
+  token="$(api_token)"
+  trips="$(curl -fsS "$URL/api/trips" -H "Authorization: Bearer $token")"
+  trip_id="$(python3 -c 'import json,sys; print(next((x["id"] for x in json.load(sys.stdin) if x["name"]=="Alpine Research Weekend"), ""))' <<<"$trips")"
+  [[ -n "$trip_id" ]] || { echo "missing seeded trip" >&2; return 1; }
+  detail="$(curl -fsS "$URL/api/trips/$trip_id" -H "Authorization: Bearer $token")"
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["days"][0]["label"]=="Arrival"; assert d["days"][0]["items"][0]["text"]=="Lodge check-in"' <<<"$detail"
+  echo "==> Verified Alpine Research Weekend / Arrival / Lodge check-in"
+}
+
+case "$COMMAND" in
+  deploy) cmd_deploy ;;
+  seed) cmd_seed ;;
+  verify) cmd_verify ;;
+  reset) echo "==> Removing Trip run containers and volume"; "${COMPOSE[@]}" down -v ;;
+  stop) echo "==> Stopping Trip run"; "${COMPOSE[@]}" stop ;;
+  status) PORT="$PORT" IMAGE_TAG="$IMAGE_NAME" "${COMPOSE[@]}" ps ; echo "==> $URL" ;;
+  logs) "${COMPOSE[@]}" logs -f ;;
+  help|--help|-h) printf '%s\n' 'Usage: ./tester-env [--port PORT] [--run-id ID] {deploy|seed|verify|reset|stop|status|logs}' ;;
+  *) echo "unknown command: $COMMAND" >&2; exit 2 ;;
+esac

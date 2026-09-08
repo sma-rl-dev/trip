@@ -1,0 +1,22 @@
+services:
+  app:
+    build: .
+    image: ${IMAGE_TAG:-tester-env-trip:dev}
+    ports:
+      - "${PORT:-18185}:8000"
+    environment:
+      SECRET_KEY: tester-env-trip-secret
+      REGISTER_ENABLE: "true"
+    volumes:
+      - trip-data:/app/storage
+    networks:
+      - app
+
+volumes:
+  trip-data:
+
+networks:
+  app:
+    ipam:
+      config:
+        - subnet: ${NETWORK_SUBNET:-10.181.161.0/24}
