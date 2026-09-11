@@ -45,7 +45,7 @@ cmd_deploy() {
 
 cmd_seed() {
   echo "==> Creating deterministic user and itinerary"
-  local registration token trips trip_id day day_id
+  local registration token trips trip_id detail arrival_id summit_id has_item has_booking
   registration="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL/api/auth/register" -H 'content-type: application/json' \
     -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")"
   [[ "$registration" == 200 || "$registration" == 409 ]] || { echo "registration failed: HTTP $registration" >&2; return 1; }
@@ -54,9 +54,25 @@ cmd_seed() {
   trip_id="$(python3 -c 'import json,sys; print(next((x["id"] for x in json.load(sys.stdin) if x["name"]=="Alpine Research Weekend"), ""))' <<<"$trips")"
   if [[ -z "$trip_id" ]]; then
     trip_id="$(curl -fsS -X POST "$URL/api/trips" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"name":"Alpine Research Weekend"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-    day="$(curl -fsS -X POST "$URL/api/trips/$trip_id/days" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"label":"Arrival","dt":"2026-10-12","notes":"Check in before dinner."}')"
-    day_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$day")"
-    curl -fsS -X POST "$URL/api/trips/$trip_id/days/$day_id/items" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"time":"18:30","text":"Lodge check-in","comment":"Reservation confirmed.","status":"booked"}' >/dev/null
+  fi
+  detail="$(curl -fsS "$URL/api/trips/$trip_id" -H "Authorization: Bearer $token")"
+  arrival_id="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["id"] for x in d.get("days",[]) if x.get("label")=="Arrival"), ""))' <<<"$detail")"
+  summit_id="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["id"] for x in d.get("days",[]) if x.get("label")=="Summit day"), ""))' <<<"$detail")"
+  if [[ -z "$arrival_id" ]]; then
+    arrival_id="$(curl -fsS -X POST "$URL/api/trips/$trip_id/days" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"label":"Arrival","dt":"2026-10-12","notes":"Check in before dinner."}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  fi
+  if [[ -z "$summit_id" ]]; then
+    curl -fsS -X POST "$URL/api/trips/$trip_id/days" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"label":"Summit day","dt":"2026-10-13","notes":"Summit hike and return."}' >/dev/null
+  fi
+  detail="$(curl -fsS "$URL/api/trips/$trip_id" -H "Authorization: Bearer $token")"
+  arrival_id="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["id"] for x in d.get("days",[]) if x.get("label")=="Arrival"), ""))' <<<"$detail")"
+  has_item="$(python3 -c 'import json,sys; d=json.load(sys.stdin); a=next((x for x in d.get("days",[]) if x.get("label")=="Arrival"), {}); print("yes" if any(i.get("text")=="Lodge check-in" for i in a.get("items",[])) else "")' <<<"$detail")"
+  if [[ -z "$has_item" ]]; then
+    curl -fsS -X POST "$URL/api/trips/$trip_id/days/$arrival_id/items" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"time":"18:30","text":"Lodge check-in","comment":"Reservation confirmed.","status":"booked"}' >/dev/null
+  fi
+  has_booking="$(python3 -c 'import json,sys; d=json.load(sys.stdin); a=next((x for x in d.get("days",[]) if x.get("label")=="Arrival"), {}); print("yes" if any(b.get("label")=="Alpine Lodge Reservation" for b in a.get("bookings",[])) else "")' <<<"$detail")"
+  if [[ -z "$has_booking" ]]; then
+    curl -fsS -X POST "$URL/api/trips/$trip_id/days/$arrival_id/bookings" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"type":"hotel","label":"Alpine Lodge Reservation","reference":"ALP-2026-1012","notes":"Two nights, breakfast included.","attachment_ids":[]}' >/dev/null
   fi
   echo "==> Seeded user $USERNAME and trip Alpine Research Weekend"
 }
@@ -69,8 +85,8 @@ cmd_verify() {
   trip_id="$(python3 -c 'import json,sys; print(next((x["id"] for x in json.load(sys.stdin) if x["name"]=="Alpine Research Weekend"), ""))' <<<"$trips")"
   [[ -n "$trip_id" ]] || { echo "missing seeded trip" >&2; return 1; }
   detail="$(curl -fsS "$URL/api/trips/$trip_id" -H "Authorization: Bearer $token")"
-  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["days"][0]["label"]=="Arrival"; assert d["days"][0]["items"][0]["text"]=="Lodge check-in"' <<<"$detail"
-  echo "==> Verified Alpine Research Weekend / Arrival / Lodge check-in"
+  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["days"][0]["label"]=="Arrival"; assert d["days"][0]["items"][0]["text"]=="Lodge check-in"; a=next(x for x in d["days"] if x["label"]=="Arrival"); s=next(x for x in d["days"] if x["label"]=="Summit day"); assert str(s.get("dt","")).startswith("2026-10-13"); assert any(b["label"]=="Alpine Lodge Reservation" for b in a.get("bookings",[]))' <<<"$detail"
+  echo "==> Verified Alpine Research Weekend / Arrival / Lodge check-in / Summit day / Alpine Lodge Reservation"
 }
 
 case "$COMMAND" in
