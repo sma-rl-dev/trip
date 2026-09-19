@@ -45,47 +45,181 @@ cmd_deploy() {
 
 cmd_seed() {
   echo "==> Creating deterministic user and itinerary"
-  local registration token trips trip_id detail arrival_id summit_id has_item has_booking
-  registration="$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$URL/api/auth/register" -H 'content-type: application/json' \
-    -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}")"
-  [[ "$registration" == 200 || "$registration" == 409 ]] || { echo "registration failed: HTTP $registration" >&2; return 1; }
-  token="$(api_token)"
-  trips="$(curl -fsS "$URL/api/trips" -H "Authorization: Bearer $token")"
-  trip_id="$(python3 -c 'import json,sys; print(next((x["id"] for x in json.load(sys.stdin) if x["name"]=="Alpine Research Weekend"), ""))' <<<"$trips")"
-  if [[ -z "$trip_id" ]]; then
-    trip_id="$(curl -fsS -X POST "$URL/api/trips" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"name":"Alpine Research Weekend"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-  fi
-  detail="$(curl -fsS "$URL/api/trips/$trip_id" -H "Authorization: Bearer $token")"
-  arrival_id="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["id"] for x in d.get("days",[]) if x.get("label")=="Arrival"), ""))' <<<"$detail")"
-  summit_id="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["id"] for x in d.get("days",[]) if x.get("label")=="Summit day"), ""))' <<<"$detail")"
-  if [[ -z "$arrival_id" ]]; then
-    arrival_id="$(curl -fsS -X POST "$URL/api/trips/$trip_id/days" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"label":"Arrival","dt":"2026-10-12","notes":"Check in before dinner."}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
-  fi
-  if [[ -z "$summit_id" ]]; then
-    curl -fsS -X POST "$URL/api/trips/$trip_id/days" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"label":"Summit day","dt":"2026-10-13","notes":"Summit hike and return."}' >/dev/null
-  fi
-  detail="$(curl -fsS "$URL/api/trips/$trip_id" -H "Authorization: Bearer $token")"
-  arrival_id="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["id"] for x in d.get("days",[]) if x.get("label")=="Arrival"), ""))' <<<"$detail")"
-  has_item="$(python3 -c 'import json,sys; d=json.load(sys.stdin); a=next((x for x in d.get("days",[]) if x.get("label")=="Arrival"), {}); print("yes" if any(i.get("text")=="Lodge check-in" for i in a.get("items",[])) else "")' <<<"$detail")"
-  if [[ -z "$has_item" ]]; then
-    curl -fsS -X POST "$URL/api/trips/$trip_id/days/$arrival_id/items" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"time":"18:30","text":"Lodge check-in","comment":"Reservation confirmed.","status":"booked"}' >/dev/null
-  fi
-  has_booking="$(python3 -c 'import json,sys; d=json.load(sys.stdin); a=next((x for x in d.get("days",[]) if x.get("label")=="Arrival"), {}); print("yes" if any(b.get("label")=="Alpine Lodge Reservation" for b in a.get("bookings",[])) else "")' <<<"$detail")"
-  if [[ -z "$has_booking" ]]; then
-    curl -fsS -X POST "$URL/api/trips/$trip_id/days/$arrival_id/bookings" -H "Authorization: Bearer $token" -H 'content-type: application/json' -d '{"type":"hotel","label":"Alpine Lodge Reservation","reference":"ALP-2026-1012","notes":"Two nights, breakfast included.","attachment_ids":[]}' >/dev/null
-  fi
+  SEED_URL="$URL" SEED_USER="$USERNAME" SEED_PASS="$PASSWORD" python3 - <<'EOF'
+import json, os, urllib.request, urllib.error
+BASE = os.environ['SEED_URL']; USER = os.environ['SEED_USER']; PW = os.environ['SEED_PASS']
+NOTES = "Valley trains run hourly; summit lodge check-in after 15:00."
+CATEGORIES = {"Lookouts": "#16a34a", "Markets": "#dc2626", "Landmarks": "#2563eb"}
+PLACES = [
+  {"name": "Alpine Lodge", "cat": "Landmarks", "lat": 46.559, "lng": 8.021,
+   "place": "Alpine Lodge, Grindelwald valley", "visited": False,
+   "description": "Valley lodge used for the Arrival night."},
+  {"name": "Harbor Viewpoint", "cat": "Lookouts", "lat": 46.601, "lng": 8.101,
+   "place": "Harbor Viewpoint terrace", "visited": False,
+   "description": "Terrace viewpoint above the harbor."},
+  {"name": "Old Town Bakery", "cat": "Markets", "lat": 46.602, "lng": 8.102,
+   "place": "Old Town Bakery, main street", "visited": False,
+   "description": "Bakery on the old town main street."},
+  {"name": "Northgate Lookout", "cat": "Lookouts", "lat": 47.001, "lng": 8.501,
+   "place": "Northgate Lookout point", "visited": True,
+   "description": "Northern gate panoramic lookout."},
+  {"name": "Riverside Market Hall", "cat": "Markets", "lat": 47.101, "lng": 8.601,
+   "place": "Riverside Market Hall", "visited": True,
+   "description": "Covered market hall by the river."},
+  {"name": "North Pier Lighthouse", "cat": "Landmarks", "lat": 47.201, "lng": 8.701,
+   "place": "North Pier Lighthouse", "visited": False,
+   "description": "Lighthouse at the end of the north pier."},
+]
+def req(method, path, token=None, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(BASE + path, data=data, method=method,
+                               headers={'content-type': 'application/json'})
+    if token:
+        r.add_header('Authorization', 'Bearer ' + token)
+    try:
+        with urllib.request.urlopen(r) as resp:
+            raw = resp.read().decode()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+def need(method, path, token=None, body=None):
+    st, out = req(method, path, token, body)
+    assert 200 <= st < 300, f"{method} {path} -> HTTP {st}"
+    return out
+st, _ = req('POST', '/api/auth/register', None, {"username": USER, "password": PW})
+assert st in (200, 409), f"register -> HTTP {st}"
+tok = need('POST', '/api/auth/login', None, {"username": USER, "password": PW})['access_token']
+trips = need('GET', '/api/trips', tok)
+trip = next((t for t in trips if t['name'] == 'Alpine Research Weekend'), None)
+if trip is None:
+    trip = need('POST', '/api/trips', tok, {"name": "Alpine Research Weekend"})
+tid = trip['id']
+detail = need('GET', f'/api/trips/{tid}', tok)
+days = {d['label']: d for d in detail.get('days', [])}
+if 'Arrival' not in days:
+    need('POST', f'/api/trips/{tid}/days', tok,
+         {"label": "Arrival", "dt": "2026-10-12", "notes": "Check in before dinner."})
+    detail = need('GET', f'/api/trips/{tid}', tok)
+    days = {d['label']: d for d in detail.get('days', [])}
+if 'Summit day' not in days:
+    need('POST', f'/api/trips/{tid}/days', tok,
+         {"label": "Summit day", "dt": "2026-10-13", "notes": "Summit hike and return."})
+    detail = need('GET', f'/api/trips/{tid}', tok)
+    days = {d['label']: d for d in detail.get('days', [])}
+arrival = days['Arrival']
+if not any(i.get('text') == 'Lodge check-in' for i in arrival.get('items', [])):
+    need('POST', f"/api/trips/{tid}/days/{arrival['id']}/items", tok,
+         {"time": "18:30", "text": "Lodge check-in",
+          "comment": "Reservation confirmed.", "status": "booked"})
+if not any(b.get('label') == 'Alpine Lodge Reservation' for b in arrival.get('bookings', [])):
+    need('POST', f"/api/trips/{tid}/days/{arrival['id']}/bookings", tok,
+         {"type": "hotel", "label": "Alpine Lodge Reservation", "reference": "ALP-2026-1012",
+          "notes": "Two nights, breakfast included.", "attachment_ids": []})
+detail = need('GET', f'/api/trips/{tid}', tok)
+if detail.get('notes') != NOTES:
+    detail = need('PUT', f'/api/trips/{tid}', tok, {"notes": NOTES})
+cats = need('GET', '/api/categories', tok)
+catmap = {c['name']: c for c in cats}
+for name, color in CATEGORIES.items():
+    if name not in catmap:
+        catmap[name] = need('POST', '/api/categories', tok, {"name": name, "color": color})
+    elif (catmap[name].get('color') or '').lower() != color.lower():
+        catmap[name] = need('PUT', f"/api/categories/{catmap[name]['id']}", tok, {"color": color})
+allplaces = need('GET', '/api/places', tok)
+pmap = {p['name']: p for p in allplaces}
+for spec in PLACES:
+    cid = catmap[spec['cat']]['id']
+    if spec['name'] not in pmap:
+        pmap[spec['name']] = need('POST', '/api/places', tok,
+                                  {"name": spec['name'], "lat": spec['lat'], "lng": spec['lng'],
+                                   "place": spec['place'], "category_id": cid,
+                                   "visited": spec['visited'], "description": spec['description']})
+    else:
+        p = pmap[spec['name']]
+        fix = {}
+        if p.get('category', {}).get('id') != cid:
+            fix['category_id'] = cid
+        if abs(float(p.get('lat', 0)) - spec['lat']) > 1e-9 or abs(float(p.get('lng', 0)) - spec['lng']) > 1e-9:
+            fix.update({"lat": spec['lat'], "lng": spec['lng']})
+        if bool(p.get('visited')) != spec['visited']:
+            fix['visited'] = spec['visited']
+        if fix:
+            pmap[spec['name']] = need('PUT', f"/api/places/{p['id']}", tok, fix)
+lodge = pmap['Alpine Lodge']
+detail = need('GET', f'/api/trips/{tid}', tok)
+if lodge['id'] not in [p['id'] for p in detail.get('places', [])]:
+    ids = [p['id'] for p in detail.get('places', [])] + [lodge['id']]
+    detail = need('PUT', f'/api/trips/{tid}', tok, {"place_ids": ids})
+arrival = next(d for d in detail['days'] if d['label'] == 'Arrival')
+item = next(i for i in arrival['items'] if i['text'] == 'Lodge check-in')
+if (item.get('place') or {}).get('id') != lodge['id']:
+    need('PUT', f"/api/trips/{tid}/days/{arrival['id']}/items/{item['id']}", tok, {"place": lodge['id']})
+print("Seeded user tester, trip Alpine Research Weekend (+notes, 3 categories, 6 places, lodge link)")
+EOF
   echo "==> Seeded user $USERNAME and trip Alpine Research Weekend"
 }
 
 cmd_verify() {
   echo "==> Verifying deterministic seed"
-  local token trips trip_id detail
-  token="$(api_token)"
-  trips="$(curl -fsS "$URL/api/trips" -H "Authorization: Bearer $token")"
-  trip_id="$(python3 -c 'import json,sys; print(next((x["id"] for x in json.load(sys.stdin) if x["name"]=="Alpine Research Weekend"), ""))' <<<"$trips")"
-  [[ -n "$trip_id" ]] || { echo "missing seeded trip" >&2; return 1; }
-  detail="$(curl -fsS "$URL/api/trips/$trip_id" -H "Authorization: Bearer $token")"
-  python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["days"][0]["label"]=="Arrival"; assert d["days"][0]["items"][0]["text"]=="Lodge check-in"; a=next(x for x in d["days"] if x["label"]=="Arrival"); s=next(x for x in d["days"] if x["label"]=="Summit day"); assert str(s.get("dt","")).startswith("2026-10-13"); assert any(b["label"]=="Alpine Lodge Reservation" for b in a.get("bookings",[]))' <<<"$detail"
+  SEED_URL="$URL" SEED_USER="$USERNAME" SEED_PASS="$PASSWORD" python3 - <<'EOF'
+import json, os, urllib.request, urllib.error
+BASE = os.environ['SEED_URL']; USER = os.environ['SEED_USER']; PW = os.environ['SEED_PASS']
+NOTES = "Valley trains run hourly; summit lodge check-in after 15:00."
+def req(method, path, token=None, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(BASE + path, data=data, method=method,
+                               headers={'content-type': 'application/json'})
+    if token:
+        r.add_header('Authorization', 'Bearer ' + token)
+    try:
+        with urllib.request.urlopen(r) as resp:
+            raw = resp.read().decode()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        return e.code, None
+def need(method, path, token=None, body=None):
+    st, out = req(method, path, token, body)
+    assert 200 <= st < 300, f"{method} {path} -> HTTP {st}"
+    return out
+tok = need('POST', '/api/auth/login', None, {"username": USER, "password": PW})['access_token']
+trips = need('GET', '/api/trips', tok)
+trip = next((t for t in trips if t['name'] == 'Alpine Research Weekend'), None)
+assert trip, "missing seeded trip"
+detail = need('GET', f"/api/trips/{trip['id']}", tok)
+assert detail['days'][0]['label'] == 'Arrival'
+assert detail['days'][0]['items'][0]['text'] == 'Lodge check-in'
+arr = next(d for d in detail['days'] if d['label'] == 'Arrival')
+smm = next(d for d in detail['days'] if d['label'] == 'Summit day')
+assert str(smm.get('dt', '')).startswith('2026-10-13')
+assert any(b['label'] == 'Alpine Lodge Reservation' for b in arr.get('bookings', []))
+assert detail.get('notes') == NOTES, "trip notes mismatch"
+item = next(i for i in arr['items'] if i['text'] == 'Lodge check-in')
+assert (item.get('place') or {}).get('name') == 'Alpine Lodge', "lodge link missing on item"
+assert any(p['name'] == 'Alpine Lodge' for p in detail.get('places', [])), "lodge missing from trip places"
+cats = need('GET', '/api/categories', tok)
+catmap = {c['name']: (c.get('color') or '').lower() for c in cats}
+assert catmap.get('Lookouts') == '#16a34a', f"Lookouts color: {catmap.get('Lookouts')}"
+assert catmap.get('Markets') == '#dc2626', f"Markets color: {catmap.get('Markets')}"
+assert catmap.get('Landmarks') == '#2563eb', f"Landmarks color: {catmap.get('Landmarks')}"
+places = need('GET', '/api/places', tok)
+pmap = {p['name']: p for p in places}
+def close(a, b):
+    return abs(float(a) - float(b)) < 1e-9
+def check(name, cat, lat, lng, visited):
+    assert name in pmap, f"missing place {name}"
+    p = pmap[name]
+    assert p['category']['name'] == cat, f"{name} category: {p['category']['name']}"
+    assert close(p['lat'], lat) and close(p['lng'], lng), f"{name} coords: {p['lat']},{p['lng']}"
+    assert bool(p.get('visited')) == visited, f"{name} visited: {p.get('visited')}"
+check('Alpine Lodge', 'Landmarks', 46.559, 8.021, False)
+check('Harbor Viewpoint', 'Lookouts', 46.601, 8.101, False)
+check('Old Town Bakery', 'Markets', 46.602, 8.102, False)
+check('Northgate Lookout', 'Lookouts', 47.001, 8.501, True)
+check('Riverside Market Hall', 'Markets', 47.101, 8.601, True)
+check('North Pier Lighthouse', 'Landmarks', 47.201, 8.701, False)
+print("Verified Alpine Research Weekend / Arrival / Lodge check-in+link / Summit day / "
+      "booking / notes / 3 categories / 6 places")
+EOF
   echo "==> Verified Alpine Research Weekend / Arrival / Lodge check-in / Summit day / Alpine Lodge Reservation"
 }
 
